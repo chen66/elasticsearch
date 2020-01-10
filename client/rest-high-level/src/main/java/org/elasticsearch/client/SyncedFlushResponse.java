@@ -18,7 +18,6 @@
  */
 package org.elasticsearch.client;
 
-import org.elasticsearch.action.ActionResponse;
 import org.elasticsearch.common.ParseField;
 import org.elasticsearch.common.ParsingException;
 import org.elasticsearch.common.xcontent.ConstructingObjectParser;
@@ -40,7 +39,7 @@ import static org.elasticsearch.common.xcontent.ConstructingObjectParser.constru
 import static org.elasticsearch.common.xcontent.ConstructingObjectParser.optionalConstructorArg;
 import static org.elasticsearch.common.xcontent.XContentParserUtils.ensureExpectedToken;
 
-public class SyncedFlushResponse extends ActionResponse implements ToXContentObject {
+public class SyncedFlushResponse implements ToXContentObject {
 
     public static final String SHARDS_FIELD = "_shards";
 
@@ -283,7 +282,7 @@ public class SyncedFlushResponse extends ActionResponse implements ToXContentObj
         private Map<String, Object> routing;
 
         @SuppressWarnings("unchecked")
-        static ConstructingObjectParser<ShardFailure, Void> PARSER = new ConstructingObjectParser<>(
+        static final ConstructingObjectParser<ShardFailure, Void> PARSER = new ConstructingObjectParser<>(
             "shardfailure",
             a -> new ShardFailure((Integer)a[0], (String)a[1], (Map<String, Object>)a[2])
         );

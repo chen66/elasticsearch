@@ -29,6 +29,7 @@ import org.elasticsearch.xpack.core.ml.job.persistence.AnomalyDetectorsIndex;
 import org.elasticsearch.xpack.core.ml.job.process.autodetect.state.ModelSnapshot;
 import org.elasticsearch.xpack.core.ml.job.results.Bucket;
 import org.elasticsearch.xpack.core.ml.job.results.ForecastRequestStats;
+import org.elasticsearch.xpack.core.ml.notifications.AuditorField;
 import org.junit.After;
 import org.junit.Before;
 
@@ -40,7 +41,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
-import static org.elasticsearch.index.mapper.MapperService.SINGLE_MAPPING_NAME;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
@@ -54,7 +54,7 @@ public class DeleteExpiredDataIT extends MlNativeAutodetectIntegTestCase {
     @Before
     public void setUpData() throws IOException {
         client().admin().indices().prepareCreate(DATA_INDEX)
-                .addMapping(SINGLE_MAPPING_NAME, "time", "type=date,format=epoch_millis")
+                .setMapping("time", "type=date,format=epoch_millis")
                 .get();
 
         // We are going to create data for last 2 days
@@ -86,7 +86,7 @@ public class DeleteExpiredDataIT extends MlNativeAutodetectIntegTestCase {
         cleanUp();
     }
 
-    public void testDeleteExpiredDataGivenNothingToDelete() throws Exception {
+    public void testDeleteExpiredData_GivenNothingToDelete() throws Exception {
         // Tests that nothing goes wrong when there's nothing to delete
         client().execute(DeleteExpiredDataAction.INSTANCE, new DeleteExpiredDataAction.Request()).get();
     }
@@ -137,7 +137,7 @@ public class DeleteExpiredDataIT extends MlNativeAutodetectIntegTestCase {
 
         for (Job.Builder job : getJobs()) {
             assertThat(getBuckets(job.getId()).size(), is(greaterThanOrEqualTo(47)));
-            assertThat(getRecords(job.getId()).size(), equalTo(1));
+            assertThat(getRecords(job.getId()).size(), equalTo(2));
             List<ModelSnapshot> modelSnapshots = getModelSnapshots(job.getId());
             assertThat(modelSnapshots.size(), equalTo(1));
             String snapshotDocId = ModelSnapshot.documentId(modelSnapshots.get(0));
@@ -166,14 +166,15 @@ public class DeleteExpiredDataIT extends MlNativeAutodetectIntegTestCase {
         client().admin().indices().prepareRefresh("*").get();
 
         // We need to wait a second to ensure the second time around model snapshots will have a different ID (it depends on epoch seconds)
-        awaitBusy(() -> false, 1, TimeUnit.SECONDS);
+        // FIXME it would be better to wait for something concrete instead of wait for time to elapse
+        assertBusy(() -> {}, 1, TimeUnit.SECONDS);
 
         for (Job.Builder job : getJobs()) {
             // Run up to now
             startDatafeed(job.getId() + "-feed", 0, now);
             waitUntilJobIsClosed(job.getId());
             assertThat(getBuckets(job.getId()).size(), is(greaterThanOrEqualTo(70)));
-            assertThat(getRecords(job.getId()).size(), equalTo(1));
+            assertThat(getRecords(job.getId()).size(), equalTo(2));
             List<ModelSnapshot> modelSnapshots = getModelSnapshots(job.getId());
             assertThat(modelSnapshots.size(), equalTo(2));
         }
@@ -183,7 +184,8 @@ public class DeleteExpiredDataIT extends MlNativeAutodetectIntegTestCase {
         long totalModelSizeStatsBeforeDelete = client().prepareSearch("*")
                 .setQuery(QueryBuilders.termQuery("result_type", "model_size_stats"))
                 .get().getHits().getTotalHits().value;
-        long totalNotificationsCountBeforeDelete = client().prepareSearch(".ml-notifications").get().getHits().getTotalHits().value;
+        long totalNotificationsCountBeforeDelete =
+            client().prepareSearch(AuditorField.NOTIFICATIONS_INDEX).get().getHits().getTotalHits().value;
         assertThat(totalModelSizeStatsBeforeDelete, greaterThan(0L));
         assertThat(totalNotificationsCountBeforeDelete, greaterThan(0L));
 
@@ -198,14 +200,11 @@ public class DeleteExpiredDataIT extends MlNativeAutodetectIntegTestCase {
         assertThat(indexUnusedStateDocsResponse.get().status(), equalTo(RestStatus.OK));
 
         // Now call the action under test
-        client().execute(DeleteExpiredDataAction.INSTANCE, new DeleteExpiredDataAction.Request()).get();
-
-        // We need to refresh to ensure the deletion is visible
-        client().admin().indices().prepareRefresh("*").get();
+        assertThat(deleteExpiredData().isDeleted(), is(true));
 
         // no-retention job should have kept all data
         assertThat(getBuckets("no-retention").size(), is(greaterThanOrEqualTo(70)));
-        assertThat(getRecords("no-retention").size(), equalTo(1));
+        assertThat(getRecords("no-retention").size(), equalTo(2));
         assertThat(getModelSnapshots("no-retention").size(), equalTo(2));
 
         List<Bucket> buckets = getBuckets("results-retention");
@@ -216,11 +215,11 @@ public class DeleteExpiredDataIT extends MlNativeAutodetectIntegTestCase {
         assertThat(getModelSnapshots("results-retention").size(), equalTo(2));
 
         assertThat(getBuckets("snapshots-retention").size(), is(greaterThanOrEqualTo(70)));
-        assertThat(getRecords("snapshots-retention").size(), equalTo(1));
+        assertThat(getRecords("snapshots-retention").size(), equalTo(2));
         assertThat(getModelSnapshots("snapshots-retention").size(), equalTo(1));
 
         assertThat(getBuckets("snapshots-retention-with-retain").size(), is(greaterThanOrEqualTo(70)));
-        assertThat(getRecords("snapshots-retention-with-retain").size(), equalTo(1));
+        assertThat(getRecords("snapshots-retention-with-retain").size(), equalTo(2));
         assertThat(getModelSnapshots("snapshots-retention-with-retain").size(), equalTo(2));
 
         buckets = getBuckets("results-and-snapshots-retention");
@@ -233,7 +232,8 @@ public class DeleteExpiredDataIT extends MlNativeAutodetectIntegTestCase {
         long totalModelSizeStatsAfterDelete = client().prepareSearch("*")
                 .setQuery(QueryBuilders.termQuery("result_type", "model_size_stats"))
                 .get().getHits().getTotalHits().value;
-        long totalNotificationsCountAfterDelete = client().prepareSearch(".ml-notifications").get().getHits().getTotalHits().value;
+        long totalNotificationsCountAfterDelete =
+            client().prepareSearch(AuditorField.NOTIFICATIONS_INDEX).get().getHits().getTotalHits().value;
         assertThat(totalModelSizeStatsAfterDelete, equalTo(totalModelSizeStatsBeforeDelete));
         assertThat(totalNotificationsCountAfterDelete, greaterThanOrEqualTo(totalNotificationsCountBeforeDelete));
 

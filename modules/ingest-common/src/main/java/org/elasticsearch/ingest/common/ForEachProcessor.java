@@ -23,12 +23,16 @@ import org.elasticsearch.ingest.AbstractProcessor;
 import org.elasticsearch.ingest.ConfigurationUtils;
 import org.elasticsearch.ingest.IngestDocument;
 import org.elasticsearch.ingest.Processor;
+import org.elasticsearch.ingest.WrappingProcessor;
+import org.elasticsearch.script.ScriptService;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import org.elasticsearch.script.ScriptService;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 
 import static org.elasticsearch.ingest.ConfigurationUtils.newConfigurationException;
 import static org.elasticsearch.ingest.ConfigurationUtils.readBooleanProperty;
@@ -43,19 +47,22 @@ import static org.elasticsearch.ingest.ConfigurationUtils.readStringProperty;
  *
  * Note that this processor is experimental.
  */
-public final class ForEachProcessor extends AbstractProcessor {
+public final class ForEachProcessor extends AbstractProcessor implements WrappingProcessor {
 
     public static final String TYPE = "foreach";
+    static final int MAX_RECURSE_PER_THREAD = 10;
 
     private final String field;
     private final Processor processor;
     private final boolean ignoreMissing;
+    private final Consumer<Runnable> genericExecutor;
 
-    ForEachProcessor(String tag, String field, Processor processor, boolean ignoreMissing) {
+    ForEachProcessor(String tag, String field, Processor processor, boolean ignoreMissing, Consumer<Runnable> genericExecutor) {
         super(tag);
         this.field = field;
         this.processor = processor;
         this.ignoreMissing = ignoreMissing;
+        this.genericExecutor = genericExecutor;
     }
 
     boolean isIgnoreMissing() {
@@ -63,29 +70,55 @@ public final class ForEachProcessor extends AbstractProcessor {
     }
 
     @Override
-    public IngestDocument execute(IngestDocument ingestDocument) throws Exception {
+    public void execute(IngestDocument ingestDocument, BiConsumer<IngestDocument, Exception> handler) {
         List<?> values = ingestDocument.getFieldValue(field, List.class, ignoreMissing);
         if (values == null) {
             if (ignoreMissing) {
-                return ingestDocument;
+                handler.accept(ingestDocument, null);
+            } else {
+                handler.accept(null, new IllegalArgumentException("field [" + field + "] is null, cannot loop over its elements."));
             }
-            throw new IllegalArgumentException("field [" + field + "] is null, cannot loop over its elements.");
+        } else {
+            List<Object> newValues = new CopyOnWriteArrayList<>();
+            innerExecute(0, values, newValues, ingestDocument, handler);
         }
-        List<Object> newValues = new ArrayList<>(values.size());
-        IngestDocument document = ingestDocument;
-        for (Object value : values) {
-            Object previousValue = ingestDocument.getIngestMetadata().put("_value", value);
-            try {
-                document = processor.execute(document);
-                if (document == null) {
-                    return null;
+    }
+
+    void innerExecute(int index, List<?> values, List<Object> newValues, IngestDocument document,
+                      BiConsumer<IngestDocument, Exception> handler) {
+        if (index == values.size()) {
+            document.setFieldValue(field, new ArrayList<>(newValues));
+            handler.accept(document, null);
+            return;
+        }
+
+        Object value = values.get(index);
+        Object previousValue = document.getIngestMetadata().put("_value", value);
+        final Thread thread = Thread.currentThread();
+        processor.execute(document, (result, e) -> {
+            if (e != null)  {
+                newValues.add(document.getIngestMetadata().put("_value", previousValue));
+                handler.accept(null, e);
+            } else if (result == null) {
+                handler.accept(null, null);
+            } else {
+                newValues.add(document.getIngestMetadata().put("_value", previousValue));
+                if (thread == Thread.currentThread() && (index + 1) % MAX_RECURSE_PER_THREAD == 0) {
+                    // we are on the same thread and we need to fork to another thread to avoid recursive stack overflow on a single thread
+                    // only fork after 10 recursive calls, then fork every 10 to keep the number of threads down
+                    genericExecutor.accept(() -> innerExecute(index + 1, values, newValues, document, handler));
+                } else {
+                    // we are on a different thread (we went asynchronous), it's safe to recurse
+                    // or we have recursed less then 10 times with the same thread, it's safe to recurse
+                    innerExecute(index + 1, values, newValues, document, handler);
                 }
-            } finally {
-                newValues.add(ingestDocument.getIngestMetadata().put("_value", previousValue));
             }
-        }
-        document.setFieldValue(field, newValues);
-        return document;
+        });
+    }
+
+    @Override
+    public IngestDocument execute(IngestDocument ingestDocument) throws Exception {
+        throw new UnsupportedOperationException("this method should not get executed");
     }
 
     @Override
@@ -97,16 +130,18 @@ public final class ForEachProcessor extends AbstractProcessor {
         return field;
     }
 
-    Processor getProcessor() {
+    public Processor getInnerProcessor() {
         return processor;
     }
 
     public static final class Factory implements Processor.Factory {
 
         private final ScriptService scriptService;
+        private final Consumer<Runnable> genericExecutor;
 
-        Factory(ScriptService scriptService) {
+        Factory(ScriptService scriptService, Consumer<Runnable> genericExecutor) {
             this.scriptService = scriptService;
+            this.genericExecutor = genericExecutor;
         }
 
         @Override
@@ -122,7 +157,7 @@ public final class ForEachProcessor extends AbstractProcessor {
             Map.Entry<String, Map<String, Object>> entry = entries.iterator().next();
             Processor processor =
                 ConfigurationUtils.readProcessor(factories, scriptService, entry.getKey(), entry.getValue());
-            return new ForEachProcessor(tag, field, processor, ignoreMissing);
+            return new ForEachProcessor(tag, field, processor, ignoreMissing, genericExecutor);
         }
     }
 }

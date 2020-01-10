@@ -19,14 +19,13 @@
 
 package org.elasticsearch.bootstrap;
 
-import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.core.Appender;
 import org.apache.logging.log4j.core.LoggerContext;
 import org.apache.logging.log4j.core.appender.ConsoleAppender;
 import org.apache.logging.log4j.core.config.Configurator;
 import org.apache.lucene.util.Constants;
-import org.elasticsearch.core.internal.io.IOUtils;
 import org.apache.lucene.util.StringHelper;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.Version;
@@ -41,6 +40,7 @@ import org.elasticsearch.common.settings.KeyStoreWrapper;
 import org.elasticsearch.common.settings.SecureSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.transport.BoundTransportAddress;
+import org.elasticsearch.core.internal.io.IOUtils;
 import org.elasticsearch.env.Environment;
 import org.elasticsearch.monitor.jvm.JvmInfo;
 import org.elasticsearch.monitor.os.OsProbe;
@@ -59,6 +59,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Internal startup code.
@@ -157,6 +158,24 @@ final class Bootstrap {
         JvmInfo.jvmInfo();
     }
 
+    /**
+     * JDK 14 bug:
+     * https://github.com/elastic/elasticsearch/issues/50512
+     * We circumvent it here by loading the offending class before installing security manager.
+     *
+     * To be removed once the JDK is fixed.
+     */
+    static void fixJDK14EAFileChannelMap() {
+        // minor time-bomb here to ensure that we reevaluate if final 14 version does not include fix.
+        if (System.getProperty("java.version").equals("14-ea")) {
+            try {
+                Class.forName("jdk.internal.misc.ExtendedMapMode", true, Bootstrap.class.getClassLoader());
+            } catch (ClassNotFoundException e) {
+                throw new RuntimeException("Unable to lookup ExtendedMapMode class", e);
+            }
+        }
+    }
+
     private void setup(boolean addShutdownHook, Environment environment) throws BootstrapException {
         Settings settings = environment.settings();
 
@@ -183,8 +202,15 @@ final class Bootstrap {
                         IOUtils.close(node, spawner);
                         LoggerContext context = (LoggerContext) LogManager.getContext(false);
                         Configurator.shutdown(context);
+                        if (node != null && node.awaitClose(10, TimeUnit.SECONDS) == false) {
+                            throw new IllegalStateException("Node didn't stop within 10 seconds. " +
+                                    "Any outstanding requests or tasks might get killed.");
+                        }
                     } catch (IOException ex) {
                         throw new ElasticsearchException("failed to stop node", ex);
+                    } catch (InterruptedException e) {
+                        LogManager.getLogger(Bootstrap.class).warn("Thread got interrupted while waiting for the node to shutdown.");
+                        Thread.currentThread().interrupt();
                     }
                 }
             });
@@ -200,6 +226,8 @@ final class Bootstrap {
 
         // Log ifconfig output before SecurityManager is installed
         IfConfig.logIfNecessary();
+
+        fixJDK14EAFileChannelMap();
 
         // install SM after natives, shutdown hooks, etc.
         try {
@@ -248,7 +276,7 @@ final class Bootstrap {
             final Path configPath) {
         Settings.Builder builder = Settings.builder();
         if (pidFile != null) {
-            builder.put(Environment.PIDFILE_SETTING.getKey(), pidFile);
+            builder.put(Environment.NODE_PIDFILE_SETTING.getKey(), pidFile);
         }
         builder.put(initialSettings);
         if (secureSettings != null) {
@@ -267,6 +295,12 @@ final class Bootstrap {
     static void stop() throws IOException {
         try {
             IOUtils.close(INSTANCE.node, INSTANCE.spawner);
+            if (INSTANCE.node != null && INSTANCE.node.awaitClose(10, TimeUnit.SECONDS) == false) {
+                throw new IllegalStateException("Node didn't stop within 10 seconds. Any outstanding requests or tasks might get killed.");
+            }
+        } catch (InterruptedException e) {
+            LogManager.getLogger(Bootstrap.class).warn("Thread got interrupted while waiting for the node to shutdown.");
+            Thread.currentThread().interrupt();
         } finally {
             INSTANCE.keepAliveLatch.countDown();
         }
@@ -333,7 +367,12 @@ final class Bootstrap {
 
             INSTANCE.start();
 
-            if (closeStandardStreams) {
+            // We don't close stderr if `--quiet` is passed, because that
+            // hides fatal startup errors. For example, if Elasticsearch is
+            // running via systemd, the init script only specifies
+            // `--quiet`, not `-d`, so we want users to be able to see
+            // startup errors via journalctl.
+            if (foreground == false) {
                 closeSysError();
             }
         } catch (NodeValidationException | RuntimeException e) {

@@ -29,6 +29,7 @@ import org.elasticsearch.cluster.metadata.IndexMetaData;
 import org.elasticsearch.cluster.metadata.Manifest;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.xcontent.NamedXContentRegistry;
 import org.elasticsearch.core.internal.io.IOUtils;
 import org.elasticsearch.gateway.WriteStateException;
 
@@ -165,15 +166,11 @@ public class NodeRepurposeCommand extends ElasticsearchNodeCommand {
             indexPaths[i] = nodePaths[i].resolve(uuid);
         }
         try {
-            IndexMetaData metaData = IndexMetaData.FORMAT.loadLatestState(logger, namedXContentRegistry, indexPaths);
+            IndexMetaData metaData = IndexMetaData.FORMAT.loadLatestState(logger, NamedXContentRegistry.EMPTY, indexPaths);
             return metaData.getIndex().getName();
         } catch (Exception e) {
             return "no name for uuid: " + uuid + ": " + e;
         }
-    }
-
-    private NodeEnvironment.NodePath[] toNodePaths(Path[] dataPaths) {
-        return Arrays.stream(dataPaths).map(NodeRepurposeCommand::createNodePath).toArray(NodeEnvironment.NodePath[]::new);
     }
 
     private Set<String> indexUUIDsFor(Set<Path> indexPaths) {
@@ -198,7 +195,7 @@ public class NodeRepurposeCommand extends ElasticsearchNodeCommand {
 
     private Manifest loadManifest(Terminal terminal, Path[] dataPaths) throws IOException {
         terminal.println(Terminal.Verbosity.VERBOSE, "Loading manifest");
-        final Manifest manifest = Manifest.FORMAT.loadLatestState(logger, namedXContentRegistry, dataPaths);
+        final Manifest manifest = Manifest.FORMAT.loadLatestState(logger, NamedXContentRegistry.EMPTY, dataPaths);
 
         if (manifest == null) {
             terminal.println(Terminal.Verbosity.SILENT, PRE_V7_MESSAGE);
@@ -221,17 +218,9 @@ public class NodeRepurposeCommand extends ElasticsearchNodeCommand {
 
     @SafeVarargs
     @SuppressWarnings("varargs")
-    private final Set<Path> uniqueParentPaths(Collection<Path>... paths) {
+    private Set<Path> uniqueParentPaths(Collection<Path>... paths) {
         // equals on Path is good enough here due to the way these are collected.
         return Arrays.stream(paths).flatMap(Collection::stream).map(Path::getParent).collect(Collectors.toSet());
-    }
-
-    private static NodeEnvironment.NodePath createNodePath(Path path) {
-        try {
-            return new NodeEnvironment.NodePath(path);
-        } catch (IOException e) {
-            throw new ElasticsearchException("Unable to investigate path: " + path + ": " + e.getMessage());
-        }
     }
 
     //package-private for testing

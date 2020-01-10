@@ -21,8 +21,8 @@ package org.elasticsearch.transport;
 
 import org.elasticsearch.Version;
 import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.support.PlainActionFuture;
 import org.elasticsearch.cluster.node.DiscoveryNode;
-import org.elasticsearch.common.CheckedBiConsumer;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.transport.TransportAddress;
 import org.elasticsearch.common.unit.TimeValue;
@@ -31,8 +31,16 @@ import org.elasticsearch.threadpool.ThreadPool;
 import org.junit.After;
 import org.junit.Before;
 
-import java.io.IOException;
 import java.net.InetAddress;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.BrokenBarrierException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -64,7 +72,7 @@ public class ConnectionManagerTests extends ESTestCase {
 
     @After
     public void stopThreadPool() {
-        threadPool.shutdown();
+        ThreadPool.terminate(threadPool, 10L, TimeUnit.SECONDS);
     }
 
     public void testConnectAndDisconnect() {
@@ -72,12 +80,12 @@ public class ConnectionManagerTests extends ESTestCase {
         AtomicInteger nodeDisconnectedCount = new AtomicInteger();
         connectionManager.addListener(new TransportConnectionListener() {
             @Override
-            public void onNodeConnected(DiscoveryNode node) {
+            public void onNodeConnected(DiscoveryNode node, Transport.Connection connection) {
                 nodeConnectedCount.incrementAndGet();
             }
 
             @Override
-            public void onNodeDisconnected(DiscoveryNode node) {
+            public void onNodeDisconnected(DiscoveryNode node, Transport.Connection connection) {
                 nodeDisconnectedCount.incrementAndGet();
             }
         });
@@ -94,8 +102,12 @@ public class ConnectionManagerTests extends ESTestCase {
         assertFalse(connectionManager.nodeConnected(node));
 
         AtomicReference<Transport.Connection> connectionRef = new AtomicReference<>();
-        CheckedBiConsumer<Transport.Connection, ConnectionProfile, IOException> validator = (c, p) -> connectionRef.set(c);
-        connectionManager.connectToNode(node, connectionProfile, validator);
+        ConnectionManager.ConnectionValidator validator = (c, p, l) -> {
+            connectionRef.set(c);
+            l.onResponse(null);
+        };
+        PlainActionFuture.get(
+            fut -> connectionManager.connectToNode(node, connectionProfile, validator, ActionListener.map(fut, x -> null)));
 
         assertFalse(connection.isClosed());
         assertTrue(connectionManager.nodeConnected(node));
@@ -115,17 +127,120 @@ public class ConnectionManagerTests extends ESTestCase {
         assertEquals(1, nodeDisconnectedCount.get());
     }
 
-    public void testConnectFails() {
+    public void testConcurrentConnects() throws Exception {
+        Set<Transport.Connection> connections = Collections.newSetFromMap(new ConcurrentHashMap<>());
+
+        DiscoveryNode node = new DiscoveryNode("", new TransportAddress(InetAddress.getLoopbackAddress(), 0), Version.CURRENT);
+        doAnswer(invocationOnMock -> {
+            ActionListener<Transport.Connection> listener = (ActionListener<Transport.Connection>) invocationOnMock.getArguments()[2];
+
+            boolean success = randomBoolean();
+            if (success) {
+                Transport.Connection connection = new TestConnect(node);
+                connections.add(connection);
+                if (randomBoolean()) {
+                    listener.onResponse(connection);
+                } else {
+                    threadPool.generic().execute(() -> listener.onResponse(connection));
+                }
+            } else {
+                threadPool.generic().execute(() -> listener.onFailure(new IllegalStateException("dummy exception")));
+            }
+            return null;
+        }).when(transport).openConnection(eq(node), eq(connectionProfile), any(ActionListener.class));
+
+        assertFalse(connectionManager.nodeConnected(node));
+
+        ConnectionManager.ConnectionValidator validator = (c, p, l) -> {
+            boolean success = randomBoolean();
+            if (success) {
+                if (randomBoolean()) {
+                    l.onResponse(null);
+                } else {
+                    threadPool.generic().execute(() -> l.onResponse(null));
+                }
+            } else {
+                threadPool.generic().execute(() -> l.onFailure(new IllegalStateException("dummy exception")));
+            }
+        };
+
+        List<Thread> threads = new ArrayList<>();
+        AtomicInteger nodeConnectedCount = new AtomicInteger();
+        AtomicInteger nodeFailureCount = new AtomicInteger();
+
+        CyclicBarrier barrier = new CyclicBarrier(11);
+        for (int i = 0; i < 10; i++) {
+            Thread thread = new Thread(() -> {
+                try {
+                    barrier.await();
+                } catch (InterruptedException | BrokenBarrierException e) {
+                    throw new RuntimeException(e);
+                }
+                CountDownLatch latch = new CountDownLatch(1);
+                connectionManager.connectToNode(node, connectionProfile, validator,
+                    ActionListener.wrap(c -> {
+                        nodeConnectedCount.incrementAndGet();
+                        if (connectionManager.nodeConnected(node) == false) {
+                            throw new AssertionError("Expected node to be connected");
+                        }
+                        assert latch.getCount() == 1;
+                        latch.countDown();
+                    }, e -> {
+                        nodeFailureCount.incrementAndGet();
+                        assert latch.getCount() == 1;
+                        latch.countDown();
+                    }));
+                try {
+                    latch.await();
+                } catch (InterruptedException e) {
+                    throw new IllegalStateException(e);
+                }
+            });
+            threads.add(thread);
+            thread.start();
+        }
+
+        barrier.await();
+        threads.forEach(t -> {
+            try {
+                t.join();
+            } catch (InterruptedException e) {
+                throw new IllegalStateException(e);
+            }
+        });
+
+        assertEquals(10, nodeConnectedCount.get() + nodeFailureCount.get());
+
+        int managedConnections = connectionManager.size();
+        if (managedConnections != 0) {
+            assertEquals(1, managedConnections);
+
+            // Only a single connection attempt should be open.
+            assertEquals(1, connections.stream().filter(c -> c.isClosed() == false).count());
+        } else {
+            // No connections succeeded
+            assertEquals(0, connections.stream().filter(c -> c.isClosed() == false).count());
+        }
+
+
+        connectionManager.close();
+        // The connection manager will close all open connections
+        for (Transport.Connection connection : connections) {
+            assertTrue(connection.isClosed());
+        }
+    }
+
+    public void testConnectFailsDuringValidation() {
         AtomicInteger nodeConnectedCount = new AtomicInteger();
         AtomicInteger nodeDisconnectedCount = new AtomicInteger();
         connectionManager.addListener(new TransportConnectionListener() {
             @Override
-            public void onNodeConnected(DiscoveryNode node) {
+            public void onNodeConnected(DiscoveryNode node, Transport.Connection connection) {
                 nodeConnectedCount.incrementAndGet();
             }
 
             @Override
-            public void onNodeDisconnected(DiscoveryNode node) {
+            public void onNodeDisconnected(DiscoveryNode node, Transport.Connection connection) {
                 nodeDisconnectedCount.incrementAndGet();
             }
         });
@@ -141,13 +256,51 @@ public class ConnectionManagerTests extends ESTestCase {
 
         assertFalse(connectionManager.nodeConnected(node));
 
-        CheckedBiConsumer<Transport.Connection, ConnectionProfile, IOException> validator = (c, p) -> {
-            throw new ConnectTransportException(node, "");
-        };
+        ConnectionManager.ConnectionValidator validator = (c, p, l) -> l.onFailure(new ConnectTransportException(node, ""));
 
-        expectThrows(ConnectTransportException.class, () -> connectionManager.connectToNode(node, connectionProfile, validator));
+        PlainActionFuture<Void> fut = new PlainActionFuture<>();
+        connectionManager.connectToNode(node, connectionProfile, validator, fut);
+        expectThrows(ConnectTransportException.class, () -> fut.actionGet());
 
         assertTrue(connection.isClosed());
+        assertFalse(connectionManager.nodeConnected(node));
+        expectThrows(NodeNotConnectedException.class, () -> connectionManager.getConnection(node));
+        assertEquals(0, connectionManager.size());
+        assertEquals(0, nodeConnectedCount.get());
+        assertEquals(0, nodeDisconnectedCount.get());
+    }
+
+    public void testConnectFailsDuringConnect() {
+        AtomicInteger nodeConnectedCount = new AtomicInteger();
+        AtomicInteger nodeDisconnectedCount = new AtomicInteger();
+        connectionManager.addListener(new TransportConnectionListener() {
+            @Override
+            public void onNodeConnected(DiscoveryNode node, Transport.Connection connection) {
+                nodeConnectedCount.incrementAndGet();
+            }
+
+            @Override
+            public void onNodeDisconnected(DiscoveryNode node, Transport.Connection connection) {
+                nodeDisconnectedCount.incrementAndGet();
+            }
+        });
+
+
+        DiscoveryNode node = new DiscoveryNode("", new TransportAddress(InetAddress.getLoopbackAddress(), 0), Version.CURRENT);
+        doAnswer(invocationOnMock -> {
+            ActionListener<Transport.Connection> listener = (ActionListener<Transport.Connection>) invocationOnMock.getArguments()[2];
+            listener.onFailure(new ConnectTransportException(node, ""));
+            return null;
+        }).when(transport).openConnection(eq(node), eq(connectionProfile), any(ActionListener.class));
+
+        assertFalse(connectionManager.nodeConnected(node));
+
+        ConnectionManager.ConnectionValidator validator = (c, p, l) -> l.onResponse(null);
+
+        PlainActionFuture<Void> fut = new PlainActionFuture<>();
+        connectionManager.connectToNode(node, connectionProfile, validator, fut);
+        expectThrows(ConnectTransportException.class, () -> fut.actionGet());
+
         assertFalse(connectionManager.nodeConnected(node));
         expectThrows(NodeNotConnectedException.class, () -> connectionManager.getConnection(node));
         assertEquals(0, connectionManager.size());
@@ -171,7 +324,6 @@ public class ConnectionManagerTests extends ESTestCase {
         @Override
         public void sendRequest(long requestId, String action, TransportRequest request, TransportRequestOptions options)
             throws TransportException {
-
         }
     }
 }

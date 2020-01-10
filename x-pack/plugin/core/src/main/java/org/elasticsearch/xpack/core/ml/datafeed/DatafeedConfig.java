@@ -31,9 +31,10 @@ import org.elasticsearch.xpack.core.ml.job.config.Job;
 import org.elasticsearch.xpack.core.ml.job.messages.Messages;
 import org.elasticsearch.xpack.core.ml.utils.ExceptionsHelper;
 import org.elasticsearch.xpack.core.ml.utils.MlStrings;
+import org.elasticsearch.xpack.core.ml.utils.QueryProvider;
 import org.elasticsearch.xpack.core.ml.utils.ToXContentParams;
 import org.elasticsearch.xpack.core.ml.utils.XContentObjectTransformer;
-import org.elasticsearch.xpack.core.ml.utils.time.TimeUtils;
+import org.elasticsearch.xpack.core.common.time.TimeUtils;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -90,6 +91,7 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
     public static final ParseField CHUNKING_CONFIG = new ParseField("chunking_config");
     public static final ParseField HEADERS = new ParseField("headers");
     public static final ParseField DELAYED_DATA_CHECK_CONFIG = new ParseField("delayed_data_check_config");
+    public static final ParseField MAX_EMPTY_SEARCHES = new ParseField("max_empty_searches");
 
     // These parsers follow the pattern that metadata is parsed leniently (to allow for enhancements), whilst config is parsed strictly
     public static final ObjectParser<Builder, Void> LENIENT_PARSER = createParser(true);
@@ -123,7 +125,7 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
         parser.declareString((builder, val) ->
             builder.setFrequency(TimeValue.parseTimeValue(val, FREQUENCY.getPreferredName())), FREQUENCY);
         parser.declareObject(Builder::setQueryProvider,
-            (p, c) -> QueryProvider.fromXContent(p, ignoreUnknownFields),
+            (p, c) -> QueryProvider.fromXContent(p, ignoreUnknownFields, Messages.DATAFEED_CONFIG_QUERY_BAD_FORMAT),
             QUERY);
         parser.declareObject(Builder::setAggregationsSafe,
             (p, c) -> AggProvider.fromXContent(p, ignoreUnknownFields),
@@ -151,6 +153,7 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
         parser.declareObject(Builder::setDelayedDataCheckConfig,
             ignoreUnknownFields ? DelayedDataCheckConfig.LENIENT_PARSER : DelayedDataCheckConfig.STRICT_PARSER,
             DELAYED_DATA_CHECK_CONFIG);
+        parser.declareInt(Builder::setMaxEmptySearches, MAX_EMPTY_SEARCHES);
         return parser;
     }
 
@@ -175,11 +178,12 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
     private final ChunkingConfig chunkingConfig;
     private final Map<String, String> headers;
     private final DelayedDataCheckConfig delayedDataCheckConfig;
+    private final Integer maxEmptySearches;
 
     private DatafeedConfig(String id, String jobId, TimeValue queryDelay, TimeValue frequency, List<String> indices,
                            QueryProvider queryProvider, AggProvider aggProvider, List<SearchSourceBuilder.ScriptField> scriptFields,
                            Integer scrollSize, ChunkingConfig chunkingConfig, Map<String, String> headers,
-                           DelayedDataCheckConfig delayedDataCheckConfig) {
+                           DelayedDataCheckConfig delayedDataCheckConfig, Integer maxEmptySearches) {
         this.id = id;
         this.jobId = jobId;
         this.queryDelay = queryDelay;
@@ -192,6 +196,7 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
         this.chunkingConfig = chunkingConfig;
         this.headers = Collections.unmodifiableMap(headers);
         this.delayedDataCheckConfig = delayedDataCheckConfig;
+        this.maxEmptySearches = maxEmptySearches;
     }
 
     public DatafeedConfig(StreamInput in) throws IOException {
@@ -204,14 +209,9 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
         } else {
             this.indices = null;
         }
-        // This consumes the list of types if there was one.
-        if (in.getVersion().before(Version.V_7_0_0)) {
-            if (in.readBoolean()) {
-                in.readStringList();
-            }
-        }
         // each of these writables are version aware
         this.queryProvider = QueryProvider.fromStream(in);
+        // This reads a boolean from the stream, if true, it sends the stream to the `fromStream` method
         this.aggProvider = in.readOptionalWriteable(AggProvider::fromStream);
 
         if (in.readBoolean()) {
@@ -221,15 +221,12 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
         }
         this.scrollSize = in.readOptionalVInt();
         this.chunkingConfig = in.readOptionalWriteable(ChunkingConfig::new);
-        if (in.getVersion().onOrAfter(Version.V_6_2_0)) {
-            this.headers = Collections.unmodifiableMap(in.readMap(StreamInput::readString, StreamInput::readString));
+        this.headers = Collections.unmodifiableMap(in.readMap(StreamInput::readString, StreamInput::readString));
+        delayedDataCheckConfig = in.readOptionalWriteable(DelayedDataCheckConfig::new);
+        if (in.getVersion().onOrAfter(Version.V_7_5_0)) {
+            maxEmptySearches = in.readOptionalVInt();
         } else {
-            this.headers = Collections.emptyMap();
-        }
-        if (in.getVersion().onOrAfter(Version.V_6_6_0)) {
-            delayedDataCheckConfig = in.readOptionalWriteable(DelayedDataCheckConfig::new);
-        } else {
-            delayedDataCheckConfig = DelayedDataCheckConfig.defaultDelayedDataCheckConfig();
+            maxEmptySearches = null;
         }
     }
 
@@ -399,6 +396,10 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
         return delayedDataCheckConfig;
     }
 
+    public Integer getMaxEmptySearches() {
+        return maxEmptySearches;
+    }
+
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         out.writeString(id);
@@ -411,15 +412,10 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
         } else {
             out.writeBoolean(false);
         }
-        // Write the now removed types to prior versions.
-        // An empty list is expected
-        if (out.getVersion().before(Version.V_7_0_0)) {
-            out.writeBoolean(true);
-            out.writeStringCollection(Collections.emptyList());
-        }
 
         // Each of these writables are version aware
         queryProvider.writeTo(out); // never null
+        // This writes a boolean to the stream, if true, it sends the stream to the `writeTo` method
         out.writeOptionalWriteable(aggProvider);
 
         if (scriptFields != null) {
@@ -430,11 +426,10 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
         }
         out.writeOptionalVInt(scrollSize);
         out.writeOptionalWriteable(chunkingConfig);
-        if (out.getVersion().onOrAfter(Version.V_6_2_0)) {
-            out.writeMap(headers, StreamOutput::writeString, StreamOutput::writeString);
-        }
-        if (out.getVersion().onOrAfter(Version.V_6_6_0)) {
-            out.writeOptionalWriteable(delayedDataCheckConfig);
+        out.writeMap(headers, StreamOutput::writeString, StreamOutput::writeString);
+        out.writeOptionalWriteable(delayedDataCheckConfig);
+        if (out.getVersion().onOrAfter(Version.V_7_5_0)) {
+            out.writeOptionalVInt(maxEmptySearches);
         }
     }
 
@@ -443,7 +438,7 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
         builder.startObject();
         builder.field(ID.getPreferredName(), id);
         builder.field(Job.ID.getPreferredName(), jobId);
-        if (params.paramAsBoolean(ToXContentParams.INCLUDE_TYPE, false) == true) {
+        if (params.paramAsBoolean(ToXContentParams.FOR_INTERNAL_STORAGE, false) == true) {
             builder.field(CONFIG_TYPE.getPreferredName(), TYPE);
         }
         builder.field(QUERY_DELAY.getPreferredName(), queryDelay.getStringRep());
@@ -471,6 +466,9 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
         }
         if (delayedDataCheckConfig != null) {
             builder.field(DELAYED_DATA_CHECK_CONFIG.getPreferredName(), delayedDataCheckConfig);
+        }
+        if (maxEmptySearches != null) {
+            builder.field(MAX_EMPTY_SEARCHES.getPreferredName(), maxEmptySearches);
         }
         builder.endObject();
         return builder;
@@ -504,13 +502,14 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
                 && Objects.equals(this.scriptFields, that.scriptFields)
                 && Objects.equals(this.chunkingConfig, that.chunkingConfig)
                 && Objects.equals(this.headers, that.headers)
-                && Objects.equals(this.delayedDataCheckConfig, that.delayedDataCheckConfig);
+                && Objects.equals(this.delayedDataCheckConfig, that.delayedDataCheckConfig)
+                && Objects.equals(this.maxEmptySearches, that.maxEmptySearches);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(id, jobId, frequency, queryDelay, indices, queryProvider, scrollSize, aggProvider, scriptFields, chunkingConfig,
-                headers, delayedDataCheckConfig);
+                headers, delayedDataCheckConfig, maxEmptySearches);
     }
 
     @Override
@@ -583,6 +582,7 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
         private ChunkingConfig chunkingConfig;
         private Map<String, String> headers = Collections.emptyMap();
         private DelayedDataCheckConfig delayedDataCheckConfig = DelayedDataCheckConfig.defaultDelayedDataCheckConfig();
+        private Integer maxEmptySearches;
 
         public Builder() { }
 
@@ -605,6 +605,7 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
             this.chunkingConfig = config.chunkingConfig;
             this.headers = new HashMap<>(config.headers);
             this.delayedDataCheckConfig = config.getDelayedDataCheckConfig();
+            this.maxEmptySearches = config.getMaxEmptySearches();
         }
 
         public void setId(String datafeedId) {
@@ -698,6 +699,18 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
             this.delayedDataCheckConfig = delayedDataCheckConfig;
         }
 
+        public void setMaxEmptySearches(int maxEmptySearches) {
+            if (maxEmptySearches == -1) {
+                this.maxEmptySearches = null;
+            } else if (maxEmptySearches <= 0) {
+                String msg = Messages.getMessage(Messages.DATAFEED_CONFIG_INVALID_OPTION_VALUE,
+                    DatafeedConfig.MAX_EMPTY_SEARCHES.getPreferredName(), maxEmptySearches);
+                throw ExceptionsHelper.badRequestException(msg);
+            } else {
+                this.maxEmptySearches = maxEmptySearches;
+            }
+        }
+
         public DatafeedConfig build() {
             ExceptionsHelper.requireNonNull(id, ID.getPreferredName());
             ExceptionsHelper.requireNonNull(jobId, Job.ID.getPreferredName());
@@ -713,7 +726,7 @@ public class DatafeedConfig extends AbstractDiffable<DatafeedConfig> implements 
 
             setDefaultQueryDelay();
             return new DatafeedConfig(id, jobId, queryDelay, frequency, indices, queryProvider, aggProvider, scriptFields, scrollSize,
-                    chunkingConfig, headers, delayedDataCheckConfig);
+                    chunkingConfig, headers, delayedDataCheckConfig, maxEmptySearches);
         }
 
         void validateScriptFields() {

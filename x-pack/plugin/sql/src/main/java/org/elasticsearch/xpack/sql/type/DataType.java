@@ -5,6 +5,7 @@
  */
 package org.elasticsearch.xpack.sql.type;
 
+import org.elasticsearch.index.mapper.NumberFieldMapper.NumberType;
 import org.elasticsearch.xpack.sql.util.DateUtils;
 
 import java.sql.JDBCType;
@@ -18,7 +19,7 @@ import java.util.Map.Entry;
 /**
  * Elasticsearch SQL data types.
  * This class also implements JDBC {@link SQLType} for properly receiving and setting values.
- * Where possible, please use the build-in, JDBC {@link Types} and {@link JDBCType} to avoid coupling
+ * Where possible, please use the built-in, JDBC {@link Types} and {@link JDBCType} to avoid coupling
  * to the API.
  */
 public enum DataType {
@@ -44,16 +45,22 @@ public enum DataType {
     OBJECT(        "object",         JDBCType.STRUCT,    -1,                0,                 0,  false, false, false),
     NESTED(        "nested",         JDBCType.STRUCT,    -1,                0,                 0,  false, false, false),
     BINARY(        "binary",         JDBCType.VARBINARY, -1,                Integer.MAX_VALUE, Integer.MAX_VALUE,  false, false, false),
-    DATE(                            JDBCType.DATE,      Long.BYTES,        24,                24, false, false, true),
     // since ODBC and JDBC interpret precision for Date as display size
-    // the precision is 23 (number of chars in ISO8601 with millis) + Z (the UTC timezone)
+    // the precision is 23 (number of chars in ISO8601 with millis) + 6 chars for the timezone (e.g.: +05:00)
     // see https://github.com/elastic/elasticsearch/issues/30386#issuecomment-386807288
-    DATETIME(      "date",           JDBCType.TIMESTAMP, Long.BYTES,        3,                 24, false, false, true),
+    DATE(                            JDBCType.DATE,      Long.BYTES,        3,                 29, false, false, true),
+    TIME(                            JDBCType.TIME,      Long.BYTES,        3,                 18, false, false, true),
+    DATETIME(      "date",           JDBCType.TIMESTAMP, Long.BYTES,        3,                 29, false, false, true),
     //
     // specialized types
     //
+    GEO_SHAPE(                       ExtTypes.GEOMETRY,  Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE, false, false, false),
+    //                                                                                 display size = 2 doubles + len("POINT( )")
+    GEO_POINT(                       ExtTypes.GEOMETRY,  Double.BYTES*2,    Integer.MAX_VALUE, 25 * 2 + 8, false, false, false),
     // IP can be v4 or v6. The latter has 2^128 addresses or 340,282,366,920,938,463,463,374,607,431,768,211,456
     // aka 39 chars
+    SHAPE(                           ExtTypes.GEOMETRY,  Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE, false, false, false),
+    //                                                                                 display size = 2 doubles + len("POINT( )")
     IP(            "ip",             JDBCType.VARCHAR,   39,               39,                 0,  false, false, true),
     //
     // INTERVALS
@@ -104,7 +111,7 @@ public enum DataType {
 
         // Date
         ODBC_TO_ES.put("SQL_DATE", DATE);
-        ODBC_TO_ES.put("SQL_TIME", DATETIME);
+        ODBC_TO_ES.put("SQL_TIME", TIME);
         ODBC_TO_ES.put("SQL_TIMESTAMP", DATETIME);
 
         // Intervals
@@ -138,7 +145,6 @@ public enum DataType {
         for (Entry<String, DataType> entry : ODBC_TO_ES.entrySet()) {
             SQL_TO_ES.put(entry.getKey().substring(4), entry.getValue());
         }
-
 
         // special ones
         SQL_TO_ES.put("BOOL", DataType.BOOLEAN);
@@ -176,7 +182,6 @@ public enum DataType {
      * String representation (assuming the maximum allowed defaultPrecision of the fractional milliseconds component).
      */
     public final int defaultPrecision;
-
 
     /**
      * Display Size
@@ -242,6 +247,18 @@ public enum DataType {
         return isNumeric();
     }
 
+    public boolean isNull() {
+        return this == NULL;
+    }
+
+    public boolean isNullOrNumeric() {
+        return isNull() || isNumeric();
+    }
+
+    public boolean isNullOrInterval() {
+        return isNull() || isInterval();
+    }
+
     public boolean isString() {
         return this == KEYWORD || this == TEXT;
     }
@@ -250,14 +267,52 @@ public enum DataType {
         return this != OBJECT && this != NESTED && this != UNSUPPORTED;
     }
 
+    public boolean isGeo() {
+        return this == GEO_POINT || this == GEO_SHAPE || this == SHAPE;
+    }
+
     public boolean isDateBased() {
         return this == DATE || this == DATETIME;
     }
+
+    public boolean isTimeBased() {
+        return this == TIME;
+    }
+
+    public boolean isDateOrTimeBased() {
+        return isDateBased() || isTimeBased();
+    }
+
+    public boolean isInterval() {
+        int ordinal = this.ordinal();
+        return ordinal >= INTERVAL_YEAR.ordinal() && ordinal <= INTERVAL_MINUTE_TO_SECOND.ordinal();
+    }
+
+    public boolean isYearMonthInterval() {
+        return this == INTERVAL_YEAR || this == INTERVAL_MONTH || this == INTERVAL_YEAR_TO_MONTH;
+    }
+
+    public boolean isDayTimeInterval() {
+        int ordinal = this.ordinal();
+        return (ordinal >= INTERVAL_DAY.ordinal() && ordinal <= INTERVAL_SECOND.ordinal())
+                || (ordinal >= INTERVAL_DAY_TO_HOUR.ordinal() && ordinal <= INTERVAL_MINUTE_TO_SECOND.ordinal());
+    }
     
+    // data type extract-able from _source or from docvalue_fields
+    public boolean isFromDocValuesOnly() {
+        return this == KEYWORD  // because of ignore_above. Extracting this from _source wouldn't make sense if it wasn't indexed at all.
+                || this == DATE         // because of date formats
+                || this == DATETIME
+                || this == SCALED_FLOAT // because of scaling_factor
+                || this == GEO_POINT
+                || this == GEO_SHAPE
+                || this == SHAPE;
+    }
+
     public static DataType fromOdbcType(String odbcType) {
         return ODBC_TO_ES.get(odbcType);
     }
-    
+
     public static DataType fromSqlOrEsType(String typeName) {
         return SQL_TO_ES.get(typeName.toUpperCase(Locale.ROOT));
     }
@@ -278,6 +333,13 @@ public enum DataType {
     }
 
     public String format() {
-        return isDateBased() ? DateUtils.DATE_PARSE_FORMAT : null;
+        return isDateOrTimeBased() ? DateUtils.DATE_PARSE_FORMAT : null;
+    }
+
+    /**
+     * Returns the appropriate NumberType enum corresponding to this es type
+     */
+    public NumberType numberType() {
+        return NumberType.valueOf(esType.toUpperCase(Locale.ROOT));
     }
 }

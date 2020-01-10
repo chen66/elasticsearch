@@ -22,6 +22,7 @@ import org.apache.lucene.search.similarities.BM25Similarity;
 import org.apache.lucene.search.similarities.Similarity;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.elasticsearch.Version;
+import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.admin.indices.stats.CommonStatsFlags;
 import org.elasticsearch.action.admin.indices.stats.IndexShardStats;
 import org.elasticsearch.cluster.ClusterName;
@@ -242,12 +243,13 @@ public class IndicesServiceTests extends ESSingleNodeTestCase {
 
 
         test = createIndex("test");
-        client().prepareIndex("test", "type", "1").setSource("field", "value").setRefreshPolicy(IMMEDIATE).get();
+        client().prepareIndex("test").setId("1").setSource("field", "value").setRefreshPolicy(IMMEDIATE).get();
         client().admin().indices().prepareFlush("test").get();
         assertHitCount(client().prepareSearch("test").get(), 1);
         IndexMetaData secondMetaData = clusterService.state().metaData().index("test");
         assertAcked(client().admin().indices().prepareClose("test"));
-        ShardPath path = ShardPath.loadShardPath(logger, getNodeEnvironment(), new ShardId(test.index(), 0), test.getIndexSettings());
+        ShardPath path = ShardPath.loadShardPath(logger, getNodeEnvironment(), new ShardId(test.index(), 0),
+            test.getIndexSettings().customDataPath());
         assertTrue(path.exists());
 
         try {
@@ -280,7 +282,8 @@ public class IndicesServiceTests extends ESSingleNodeTestCase {
         assertTrue(indexShard.routingEntry().started());
 
         final ShardPath shardPath = indexShard.shardPath();
-        assertEquals(ShardPath.loadShardPath(logger, getNodeEnvironment(), indexShard.shardId(), indexSettings), shardPath);
+        assertEquals(ShardPath.loadShardPath(logger, getNodeEnvironment(), indexShard.shardId(), indexSettings.customDataPath()),
+            shardPath);
 
         final IndicesService indicesService = getIndicesService();
         expectThrows(ShardLockObtainFailedException.class, () ->
@@ -329,8 +332,10 @@ public class IndicesServiceTests extends ESSingleNodeTestCase {
                 fail(e.getMessage());
             }
         });
-        assertThat(indicesService.hasUncompletedPendingDeletes(), equalTo(hasBogus)); // "bogus" index has not been removed
-        assertFalse(shardPath.exists());
+        assertBusy(() -> {
+            assertThat(indicesService.hasUncompletedPendingDeletes(), equalTo(hasBogus)); // "bogus" index has not been removed
+            assertFalse(shardPath.exists());
+        });
     }
 
     public void testVerifyIfIndexContentDeleted() throws Exception {
@@ -385,20 +390,42 @@ public class IndicesServiceTests extends ESSingleNodeTestCase {
                                                              .numberOfShards(1)
                                                              .numberOfReplicas(0)
                                                              .build();
-        DanglingListener listener = new DanglingListener();
-        dangling.allocateDangled(Arrays.asList(indexMetaData), listener);
-        listener.latch.await();
+        CountDownLatch latch = new CountDownLatch(1);
+        dangling.allocateDangled(Arrays.asList(indexMetaData), ActionListener.wrap(latch::countDown));
+        latch.await();
         assertThat(clusterService.state(), equalTo(originalState));
 
         // remove the alias
         client().admin().indices().prepareAliases().removeAlias(indexName, alias).get();
 
         // now try importing a dangling index with the same name as the alias, it should succeed.
-        listener = new DanglingListener();
-        dangling.allocateDangled(Arrays.asList(indexMetaData), listener);
-        listener.latch.await();
+        latch = new CountDownLatch(1);
+        dangling.allocateDangled(Arrays.asList(indexMetaData), ActionListener.wrap(latch::countDown));
+        latch.await();
         assertThat(clusterService.state(), not(originalState));
         assertNotNull(clusterService.state().getMetaData().index(alias));
+    }
+
+    public void testDanglingIndicesWithLaterVersion() throws Exception {
+        final String indexNameLater = "test-idxnewer";
+        final ClusterService clusterService = getInstanceFromNode(ClusterService.class);
+        final ClusterState originalState = clusterService.state();
+
+        //import an index with minor version incremented by one over cluster master version, it should be ignored
+        final LocalAllocateDangledIndices dangling = getInstanceFromNode(LocalAllocateDangledIndices.class);
+        final Settings idxSettingsLater = Settings.builder().put(IndexMetaData.SETTING_VERSION_CREATED,
+                                                                Version.fromId(Version.CURRENT.id + 10000))
+                                                            .put(IndexMetaData.SETTING_INDEX_UUID, UUIDs.randomBase64UUID())
+                                                            .build();
+        final IndexMetaData indexMetaDataLater = new IndexMetaData.Builder(indexNameLater)
+                                                             .settings(idxSettingsLater)
+                                                             .numberOfShards(1)
+                                                             .numberOfReplicas(0)
+                                                             .build();
+        CountDownLatch latch = new CountDownLatch(1);
+        dangling.allocateDangled(Arrays.asList(indexMetaDataLater), ActionListener.wrap(latch::countDown));
+        latch.await();
+        assertThat(clusterService.state(), equalTo(originalState));
     }
 
     /**
@@ -431,20 +458,6 @@ public class IndicesServiceTests extends ESSingleNodeTestCase {
         indicesService.verifyIndexIsDeleted(tombstonedIndex, clusterState);
     }
 
-    private static class DanglingListener implements LocalAllocateDangledIndices.Listener {
-        final CountDownLatch latch = new CountDownLatch(1);
-
-        @Override
-        public void onResponse(LocalAllocateDangledIndices.AllocateDangledResponse response) {
-            latch.countDown();
-        }
-
-        @Override
-        public void onFailure(Throwable e) {
-            latch.countDown();
-        }
-    }
-
     /**
      * Tests that teh {@link MapperService} created by {@link IndicesService#createIndexMapperService(IndexMetaData)} contains
      * custom types and similarities registered by plugins
@@ -463,8 +476,8 @@ public class IndicesServiceTests extends ESSingleNodeTestCase {
             .numberOfReplicas(0)
             .build();
         MapperService mapperService = indicesService.createIndexMapperService(indexMetaData);
-        assertNotNull(mapperService.documentMapperParser().parserContext("type").typeParser("fake-mapper"));
-        Similarity sim = mapperService.documentMapperParser().parserContext("type").getSimilarity("test").get();
+        assertNotNull(mapperService.documentMapperParser().parserContext().typeParser("fake-mapper"));
+        Similarity sim = mapperService.documentMapperParser().parserContext().getSimilarity("test").get();
         assertThat(sim, instanceOf(NonNegativeScoresSimilarity.class));
         sim = ((NonNegativeScoresSimilarity) sim).getDelegate();
         assertThat(sim, instanceOf(BM25Similarity.class));
@@ -524,7 +537,7 @@ public class IndicesServiceTests extends ESSingleNodeTestCase {
 
     public void testIsMetaDataField() {
         IndicesService indicesService = getIndicesService();
-        final Version randVersion = VersionUtils.randomVersionBetween(random(), Version.V_6_0_0, Version.CURRENT);
+        final Version randVersion = VersionUtils.randomIndexCompatibleVersion(random());
         assertFalse(indicesService.isMetaDataField(randVersion, randomAlphaOfLengthBetween(10, 15)));
         for (String builtIn : IndicesModule.getBuiltInMetaDataFields()) {
             assertTrue(indicesService.isMetaDataField(randVersion, builtIn));
@@ -583,7 +596,7 @@ public class IndicesServiceTests extends ESSingleNodeTestCase {
     }
 
     public void testOverShardLimit() {
-        int nodesInCluster = randomIntBetween(1,100);
+        int nodesInCluster = randomIntBetween(1,90);
         ClusterShardLimitIT.ShardCounts counts = forDataNodeCount(nodesInCluster);
 
         Settings clusterSettings = Settings.builder()
@@ -605,7 +618,7 @@ public class IndicesServiceTests extends ESSingleNodeTestCase {
     }
 
     public void testUnderShardLimit() {
-        int nodesInCluster = randomIntBetween(2,100);
+        int nodesInCluster = randomIntBetween(2,90);
         // Calculate the counts for a cluster 1 node smaller than we have to ensure we have headroom
         ClusterShardLimitIT.ShardCounts counts = forDataNodeCount(nodesInCluster - 1);
 
